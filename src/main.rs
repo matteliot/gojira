@@ -116,7 +116,7 @@ struct Comb<const N: usize> {
 }
 
 impl<const N: usize> Comb<N> {
-    const NEW: Self = Self { buf: [0.0; N], len: N, i: 0, filt: 0.0 };
+    const NEW: Self = Self { buf: [0.0; N], len: 0, i: 0, filt: 0.0 };
 
     #[inline]
     fn process(&mut self, x: f32, fb: f32, damp: f32) -> f32 {
@@ -139,7 +139,7 @@ struct Allpass<const N: usize> {
 }
 
 impl<const N: usize> Allpass<N> {
-    const NEW: Self = Self { buf: [0.0; N], len: N, i: 0 };
+    const NEW: Self = Self { buf: [0.0; N], len: 0, i: 0 };
 
     #[inline]
     fn process(&mut self, x: f32) -> f32 {
@@ -211,6 +211,19 @@ impl Reverb {
 
 // ---------------------------------------------------------------- state
 
+/// The delay lines. They are all zero at rest, so they live in .bss and add
+/// nothing to the patch file; `patch_init` zeroes them before use.
+struct Bufs {
+    wh_line: Delay<4096>,
+    cho_line: Delay<1024>,
+    echo: Delay<32768>,
+    rev: Reverb,
+}
+
+impl Bufs {
+    const NEW: Self = Self { wh_line: Delay::NEW, cho_line: Delay::NEW, echo: Delay::NEW, rev: Reverb::NEW };
+}
+
 struct Gj {
     ready: bool,
     error: bool,
@@ -252,18 +265,13 @@ struct Gj {
     gate_open: bool,
     comp: f32,
     // whammy
-    wh_line: Delay<4096>,
     wh_ph: f32,
     wh_semi: f32,
     wh_mix: f32,
     wh_lock: u32,
     // chorus and echo
-    cho_line: Delay<1024>,
     cho_ph: f32,
-    echo: Delay<32768>,
     echo_lp: OnePole,
-    // reverb
-    rev: Reverb,
     // coefficients
     c_param: f32,
     c_mix: f32,
@@ -314,16 +322,12 @@ impl Gj {
         gate: 0.0,
         gate_open: false,
         comp: 1.0,
-        wh_line: Delay::NEW,
         wh_ph: 0.0,
         wh_semi: WH_SEMIS,
         wh_mix: 0.0,
         wh_lock: 0,
-        cho_line: Delay::NEW,
         cho_ph: 0.0,
-        echo: Delay::NEW,
         echo_lp: OnePole::NEW,
-        rev: Reverb::NEW,
         c_param: 1.0,
         c_mix: 1.0,
         c_att: 1.0,
@@ -336,7 +340,7 @@ impl Gj {
         c_wh_fade: 1.0,
     };
 
-    fn init(&mut self) {
+    fn init(&mut self, b: &mut Bufs) {
         self.hp_in.highpass(80.0, 0.707);
         // Sirius: a tight boost (mid hump, lows left alone) ...
         self.boost_hp.highpass(BOOST_HP, 0.5);
@@ -364,7 +368,7 @@ impl Gj {
         self.cab[4].lowpass(5500.0, 0.8);
         self.cab[5].lowpass(6500.0, 0.6);
         self.echo_lp.set(ECHO_LP);
-        self.rev.init();
+        b.rev.init();
         self.c_param = coef(0.02);
         self.c_mix = coef(0.012);
         self.c_att = coef(0.0005);
@@ -393,8 +397,8 @@ impl Gj {
     /// Whammy: two crossfaded taps sweeping through a short delay line (the
     /// read point moves at `ratio` times the write point).
     #[inline]
-    fn shift(&mut self, x: f32, ratio: f32) -> f32 {
-        self.wh_line.push(x);
+    fn shift(&mut self, line: &mut Delay<4096>, x: f32, ratio: f32) -> f32 {
+        line.push(x);
         self.wh_ph += (ratio - 1.0) * (1.0 / WH_WIN);
         self.wh_ph -= floor(self.wh_ph);
         let mut p2 = self.wh_ph + 0.5;
@@ -404,9 +408,9 @@ impl Gj {
         // Hann windows half a window apart sum to 1; each is silent when its
         // tap jumps back.
         let g1 = 0.5 - 0.5 * cos(TAU * self.wh_ph);
-        let a = self.wh_line.read((1.0 - self.wh_ph) * WH_WIN + 1.0);
-        let b = self.wh_line.read((1.0 - p2) * WH_WIN + 1.0);
-        a * g1 + b * (1.0 - g1)
+        let a = line.read((1.0 - self.wh_ph) * WH_WIN + 1.0);
+        let c = line.read((1.0 - p2) * WH_WIN + 1.0);
+        a * g1 + c * (1.0 - g1)
     }
 
     /// Sirius voice: tight boost -> two-stage high-gain preamp -> tone stack
@@ -444,7 +448,7 @@ impl Gj {
     }
 
     #[inline]
-    fn tick(&mut self, x: f32) -> (f32, f32) {
+    fn tick(&mut self, b: &mut Bufs, x: f32) -> (f32, f32) {
         self.g_pre += (self.g_pre_t - self.g_pre) * self.c_param;
         self.out_g += (self.out_t - self.out_g) * self.c_param;
         self.space_s += (self.space - self.space_s) * self.c_param;
@@ -475,7 +479,7 @@ impl Gj {
         self.wh_semi += (WH_SEMIS - self.wh_semi) * self.c_wh_rise;
         let wt = if self.whammy && self.loud { 1.0 } else { 0.0 };
         self.wh_mix += (wt - self.wh_mix) * self.c_wh_fade;
-        let s = self.shift(x, exp2(self.wh_semi * (1.0 / 12.0)));
+        let s = self.shift(&mut b.wh_line, x, exp2(self.wh_semi * (1.0 / 12.0)));
         let xd = x + (s - x) * self.wh_mix;
 
         // Both voices always run, so switching is a click-free crossfade.
@@ -489,22 +493,22 @@ impl Gj {
 
         // Stereo chorus on the clean: two taps swept in quadrature.
         let sp = self.space_s;
-        self.cho_line.push(y);
+        b.cho_line.push(y);
         self.cho_ph += CHO_RATE / SR;
         if self.cho_ph >= 1.0 {
             self.cho_ph -= 1.0;
         }
         let w = TAU * self.cho_ph;
         let cho = CHO_MIX * sp * (1.0 - m);
-        let yl = y + cho * self.cho_line.read(CHO_DELAY + CHO_DEPTH * sin(w));
-        let yr = y + cho * self.cho_line.read(CHO_DELAY + CHO_DEPTH * cos(w));
+        let yl = y + cho * b.cho_line.read(CHO_DELAY + CHO_DEPTH * sin(w));
+        let yr = y + cho * b.cho_line.read(CHO_DELAY + CHO_DEPTH * cos(w));
 
         // Echo, then the shared reverb (so its tail carries across a switch).
-        let e = self.echo.read(ECHO_TIME);
+        let e = b.echo.read(ECHO_TIME);
         let fb = self.echo_lp.process(e) * ECHO_FB;
-        self.echo.push(0.5 * (yl + yr) * ECHO_SEND * sp * (1.0 - m) + fb);
+        b.echo.push(0.5 * (yl + yr) * ECHO_SEND * sp * (1.0 - m) + fb);
         let room = ROOM_MIN + ROOM_RANGE * sp;
-        let (wl, wr) = self.rev.process(0.5 * (yl + yr) + e, room);
+        let (wl, wr) = b.rev.process(0.5 * (yl + yr) + e, room);
         let wet = sp * (MAGMA_WET + (SIRIUS_WET - MAGMA_WET) * m);
         (limit((yl + e + wet * wl) * self.out_g), limit((yr + e + wet * wr) * self.out_g))
     }
@@ -536,14 +540,30 @@ fn limit(x: f32) -> f32 {
 
 /// All patch state. The firmware calls every entry point from the audio
 /// thread (SDK: "no need to synchronize").
-struct Global(UnsafeCell<Gj>);
-unsafe impl Sync for Global {}
-static STATE: Global = Global(UnsafeCell::new(Gj::NEW));
+struct Global<T>(UnsafeCell<T>);
+unsafe impl<T> Sync for Global<T> {}
+static STATE: Global<Gj> = Global(UnsafeCell::new(Gj::NEW));
+static BUFS: Global<Bufs> = Global(UnsafeCell::new(Bufs::NEW));
 
 #[allow(clippy::mut_from_ref)]
 fn state() -> &'static mut Gj {
     // SAFETY: single-threaded access from the firmware's audio thread.
     unsafe { &mut *STATE.0.get() }
+}
+
+#[allow(clippy::mut_from_ref)]
+fn bufs() -> &'static mut Bufs {
+    // SAFETY: as `state`.
+    unsafe { &mut *BUFS.0.get() }
+}
+
+/// Zeroes the delay lines in place. The loader should already have cleared
+/// .bss, but nothing promises it, and a NaN left in a feedback loop never
+/// decays. (In place: a zeroed copy would be a 324 KB stack temporary.)
+fn clear_bufs() {
+    // SAFETY: `Bufs` is only f32 and usize fields, so all-zero bits are a
+    // valid value; single-threaded as `state`.
+    unsafe { core::ptr::write_bytes(BUFS.0.get(), 0, 1) }
 }
 
 // ---------------------------------------------------------------- entry points
@@ -556,7 +576,8 @@ unsafe extern "C" fn patch_init(env: *const PatchEnv) {
     if env.is_null() || unsafe { (*env).abi_version } != PATCH_ABI_VERSION as u32 {
         return;
     }
-    state().init();
+    clear_bufs();
+    state().init(bufs());
 }
 
 unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *mut f32, samples: i32) -> f32 {
@@ -566,12 +587,12 @@ unsafe extern "C" fn update_buffers(_: *const PatchEnv, left: *mut f32, right: *
     }
     // SAFETY: the firmware passes two buffers of `samples` floats.
     let (l, r) = unsafe { (core::slice::from_raw_parts_mut(left, n), core::slice::from_raw_parts_mut(right, n)) };
-    let s = state();
+    let (s, bf) = (state(), bufs());
     if !s.ready {
         return 0.0;
     }
     for (a, b) in l.iter_mut().zip(r.iter_mut()) {
-        let (ol, or) = s.tick(*a);
+        let (ol, or) = s.tick(bf, *a);
         *a = ol;
         *b = or;
     }
