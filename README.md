@@ -58,7 +58,7 @@ cargo build --release        # ELF for the pedal (default target is thumbv7em-no
 cargo sim                    # -> target/render/gojira_demo.wav
 ```
 
-This renders original drop-C riffs at 120 bpm on a modelled electric guitar (`src/guitar.rs`):
+This renders original drop-C riffs at 120 bpm on a modelled electric guitar (`src/pedalkit/guitar.rs`):
 
 1. Magma: ringing clean arpeggios (Cm9, Abmaj7, Bb, Fsus2) into the chorus, echo and room.
 2. A pick scrape down the wound strings.
@@ -67,3 +67,9 @@ This renders original drop-C riffs at 120 bpm on a modelled electric guitar (`sr
 5. Staccato hits and a last chord left to ring, muted into the reverb tail.
 
 Then it prints the level and stereo width of each section.
+
+## Code layout
+
+- `src/gojira/`: the pedal. `patch.rs` wires it up, `presets.rs` holds every number, and the other files are its blocks.
+- `src/pedalkit/`: shared building blocks (effects, DSP, the Endless ABI, the entry points, the demo renderer). It's a copy of the master in [superPedal](https://github.com/matteliot/superPedal), which also carries this pedal, so don't edit it here.
+- `src/host/`: the `cargo sim` demo (`score.rs` is what it plays).
